@@ -15,7 +15,7 @@ try:
 except Exception:
     pass
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -221,6 +221,21 @@ async def job_daily_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.warning("Failed to send reminder to %s: %s", user["user_id"], e)
 
 
+async def _post_init(app: Application) -> None:
+    # Register the command menu with Telegram clients
+    commands = [
+        BotCommand("start", "Register and show help"),
+        BotCommand("tariff", "Show current tariff"),
+        BotCommand("set_tariff", "Set tariff per kWh"),
+        BotCommand("enter", "Save this month's reading"),
+        BotCommand("remove_last", "Remove your last saved reading"),
+    ]
+    try:
+        await app.bot.set_my_commands(commands)
+    except Exception as e:
+        logger.warning("Failed to set bot commands: %s", e)
+
+
 def main() -> None:
     if not BOT_TOKEN or "YOUR_TELEGRAM_BOT_TOKEN" in BOT_TOKEN or BOT_TOKEN.startswith("123456:"):
         raise SystemExit(
@@ -228,7 +243,7 @@ def main() -> None:
         )
     init_db(DB_PATH)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
