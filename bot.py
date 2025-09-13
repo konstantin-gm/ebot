@@ -40,13 +40,35 @@ from storage import (
     delete_reading_by_id,
 )
 
-# Optional OCR deps
+# Optional OCR deps and Tesseract binary
 try:
     import cv2  # type: ignore
     import pytesseract  # type: ignore
     import numpy as np  # type: ignore
-    _OCR_AVAILABLE = True
-except Exception:
+    try:
+        from pytesseract import TesseractNotFoundError  # type: ignore
+    except Exception:
+        class TesseractNotFoundError(Exception):
+            pass
+
+    # Allow setting explicit Tesseract path via env
+    _TESS_CMD = os.getenv("TESSERACT_CMD")
+    if _TESS_CMD:
+        pytesseract.pytesseract.tesseract_cmd = _TESS_CMD
+
+    def _tesseract_ok() -> bool:
+        try:
+            _ = pytesseract.get_tesseract_version()
+            return True
+        except TesseractNotFoundError:
+            logger.warning("Tesseract binary not found. Install it or set TESSERACT_CMD.")
+            return False
+        except Exception as e:
+            logger.warning("Tesseract check failed: %s", e)
+            return False
+
+    _OCR_AVAILABLE = _tesseract_ok()
+except Exception as _e:  # pragma: no cover
     _OCR_AVAILABLE = False
 
 
@@ -166,6 +188,78 @@ def _ocr_number_from_image(img_bgr) -> Optional[float]:
             return src_gray[y0:y1, x0:x1]
 
         roi = find_display_roi(gray_eq)
+
+        # Odometer-style printed digits segmentation: split into 5 slices and
+        # OCR each digit individually with Tesseract in single-char mode.
+        def odometer_segmented(roi_gray: np.ndarray) -> Optional[str]:
+            H, W = roi_gray.shape[:2]
+            if H < 10 or W < 50:
+                return None
+            # Keep upper portion to avoid secondary row
+            roi_u = roi_gray[0:int(0.7 * H), :]
+            # Threshold variants
+            _, bin_white = cv2.threshold(roi_u, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)   # digits white
+            _, bin_black = cv2.threshold(roi_u, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)  # digits black
+            bin_white = cv2.morphologyEx(bin_white, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+
+            # Find digit span using largest white components
+            contours, _ = cv2.findContours(bin_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            comps = []
+            for c in contours:
+                x, y, w2, h2 = cv2.boundingRect(c)
+                area = w2 * h2
+                if h2 < 0.45 * roi_u.shape[0] or area < 0.003 * (roi_u.shape[0] * roi_u.shape[1]):
+                    continue
+                comps.append((x, y, w2, h2, area))
+            if len(comps) >= 3:
+                x_min = min(x for (x, y, w2, h2, a) in comps)
+                x_max = max(x + w2 for (x, y, w2, h2, a) in comps)
+            else:
+                # Fallback to full width
+                x_min, x_max = 0, roi_u.shape[1] - 1
+
+            span = max(20, x_max - x_min)
+            digit_w = span / 5.0
+
+            out_chars: list[str] = []
+            for i in range(5):
+                x0 = int(x_min + i * digit_w)
+                x1 = int(x_min + (i + 1) * digit_w)
+                pad = int(0.06 * digit_w)
+                x0 = max(0, x0 - pad)
+                x1 = min(roi_u.shape[1], x1 + pad)
+                dimg = bin_black[:, x0:x1]
+                if dimg.size == 0 or dimg.shape[1] < 5:
+                    return None
+                # Normalize size for Tesseract
+                dimg = cv2.resize(dimg, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+                conf = "--oem 1 --psm 10 -c tessedit_char_whitelist=0123456789 classify_bln_numeric_mode=1"
+                try:
+                    t = pytesseract.image_to_string(dimg, config=conf)
+                except Exception:
+                    return None
+                t = re.sub(r"\D", "", t or "")
+                if len(t) == 0:
+                    # Try inverted single-digit too
+                    try:
+                        t2 = pytesseract.image_to_string(255 - dimg, config=conf)
+                        t2 = re.sub(r"\D", "", t2 or "")
+                    except Exception:
+                        t2 = ""
+                    if len(t2) == 0:
+                        return None
+                    out_chars.append(t2[0])
+                else:
+                    out_chars.append(t[0])
+            s = "".join(out_chars)
+            return s if len(s) == 5 else None
+
+        s_od = odometer_segmented(roi)
+        if s_od and len(s_od) == 5:
+            try:
+                return float(s_od)
+            except Exception:
+                pass
 
         # Seven-segment specific recognition (helps distinguish 2 vs 7)
         def sevenseg_read(roi_gray: np.ndarray) -> Optional[str]:
