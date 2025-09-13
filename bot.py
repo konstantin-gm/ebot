@@ -39,6 +39,15 @@ from storage import (
     delete_reading_by_id,
 )
 
+# Optional OCR deps
+try:
+    import cv2  # type: ignore
+    import pytesseract  # type: ignore
+    import numpy as np  # type: ignore
+    _OCR_AVAILABLE = True
+except Exception:
+    _OCR_AVAILABLE = False
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -96,6 +105,35 @@ def _parse_date(text: str) -> Optional[datetime]:
         except Exception:
             continue
     return None
+
+
+def _ocr_number_from_image(img_bgr) -> Optional[float]:
+    if not _OCR_AVAILABLE:
+        return None
+    try:
+        img = img_bgr
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Denoise & enhance contrast
+        gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        # Adaptive threshold to emphasize digits
+        th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 31, 10)
+        # Morphological closing to connect segments
+        kernel = np.ones((3, 3), np.uint8)
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # OCR restricted to digits, dot, comma
+        config = "--psm 6 -c tessedit_char_whitelist=0123456789.,"
+        text = pytesseract.image_to_string(th, config=config)
+        val = _parse_float(text)
+        if val is not None:
+            return val
+        # Fallback: try raw gray
+        text2 = pytesseract.image_to_string(gray, config=config)
+        return _parse_float(text2)
+    except Exception:
+        return None
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -211,6 +249,33 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reading_value: Optional[float] = None
     if msg.caption:
         reading_value = _parse_float(msg.caption)
+    if reading_value is None and _OCR_AVAILABLE:
+        try:
+            # Download photo to temp path
+            file = await context.bot.get_file(file_id)
+            import tempfile, os as _os
+            _os.makedirs("data/tmp", exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir="data/tmp", delete=False, suffix=".jpg") as tmp:
+                tmp_path = tmp.name
+            await file.download_to_drive(custom_path=tmp_path)
+            # Read and OCR
+            img = cv2.imread(tmp_path)
+            if img is not None:
+                detected = _ocr_number_from_image(img)
+                if detected is not None:
+                    reading_value = detected
+                    try:
+                        await msg.reply_text(f"Detected reading from photo: {detected}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning("OCR failed: %s", e)
+        finally:
+            try:
+                if 'tmp_path' in locals():
+                    os.remove(tmp_path)
+            except Exception:
+                pass
     await _save_reading_and_reply(update, reading_value, file_id)
 
 
