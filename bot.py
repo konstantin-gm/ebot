@@ -1,0 +1,220 @@
+import os
+import re
+import logging
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+from typing import Optional
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from storage import (
+    init_db,
+    get_or_create_user,
+    set_tariff,
+    get_tariff,
+    month_key_for,
+    record_reading,
+    get_last_reading_before_month,
+    get_reading_for_month,
+    get_history,
+    list_users,
+)
+
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+DB_PATH = os.getenv("EBOT_DB_PATH", os.path.join("data", "ebot.sqlite3"))
+TZ_NAME = os.getenv("EBOT_TZ", "UTC")
+REMINDER_START_DAY = int(os.getenv("EBOT_REMINDER_START_DAY", "20"))
+REMINDER_END_DAY = int(os.getenv("EBOT_REMINDER_END_DAY", "24"))
+REMINDER_HOUR = int(os.getenv("EBOT_REMINDER_HOUR", "9"))  # local hour
+
+
+def _now_tz() -> datetime:
+    return datetime.now(ZoneInfo(TZ_NAME))
+
+
+def _parse_float(text: str) -> Optional[float]:
+    try:
+        # accept comma or dot
+        text = text.strip().replace(",", ".")
+        return float(text)
+    except Exception:
+        # try to extract first number
+        m = re.search(r"[-+]?\d+[\.,]?\d*", text)
+        if m:
+            try:
+                return float(m.group(0).replace(",", "."))
+            except Exception:
+                return None
+        return None
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    get_or_create_user(DB_PATH, user.id, chat_id)
+    msg = (
+        "Welcome to ebot!\n\n"
+        "I’ll remind you before the 25th each month to enter your electricity meter reading.\n\n"
+        "Commands:\n"
+        "- /tariff — show current tariff\n"
+        "- /set_tariff <price> — set tariff per kWh\n"
+        "- /enter <reading> — record current meter reading\n"
+        "- /history — show recent months\n\n"
+        "You can also send a number as a message, or upload a photo (optionally with the reading in the caption)."
+    )
+    await update.message.reply_text(msg)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await cmd_start(update, context)
+
+
+async def cmd_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    t = get_tariff(DB_PATH, user.id)
+    await update.message.reply_text(f"Your tariff: {t:.4f} per kWh")
+
+
+async def cmd_set_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text("Usage: /set_tariff <price>")
+        return
+    value = _parse_float(" ".join(context.args))
+    if value is None or value < 0:
+        await update.message.reply_text("Please provide a valid non-negative number.")
+        return
+    set_tariff(DB_PATH, user.id, float(value))
+    await update.message.reply_text(f"Tariff updated: {float(value):.4f} per kWh")
+
+
+async def _save_reading_and_reply(update: Update, reading_value: Optional[float], photo_file_id: Optional[str]) -> None:
+    user = update.effective_user
+    now = _now_tz()
+    mk = month_key_for(now)
+    tariff = get_tariff(DB_PATH, user.id)
+    record_reading(DB_PATH, user.id, mk, reading_value, photo_file_id, tariff if reading_value is not None else None)
+    current = get_reading_for_month(DB_PATH, user.id, mk)
+    prev = get_last_reading_before_month(DB_PATH, user.id, mk)
+
+    if reading_value is None:
+        await update.effective_message.reply_text("Photo saved. Please send the reading value as a number or with a caption.")
+        return
+
+    if prev and prev.get("reading_value") is not None:
+        delta = float(reading_value) - float(prev["reading_value"])  # type: ignore
+        if delta < 0:
+            msg = (
+                f"Saved {reading_value} for {mk}. Previous was {prev['reading_value']} — delta negative, please double-check."
+            )
+            await update.effective_message.reply_text(msg)
+            return
+        cost = delta * float(tariff)
+        msg = (
+            f"Saved {reading_value} for {mk}.\n"
+            f"Used: {delta:.3f} kWh × {tariff:.4f} = {cost:.2f}"
+        )
+        await update.effective_message.reply_text(msg)
+    else:
+        await update.effective_message.reply_text(
+            f"Saved {reading_value} for {mk}. No previous reading to compute usage."
+        )
+
+
+async def cmd_enter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /enter <reading>")
+        return
+    value = _parse_float(" ".join(context.args))
+    if value is None:
+        await update.message.reply_text("Please send a valid number.")
+        return
+    await _save_reading_and_reply(update, value, None)
+
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg or not msg.photo:
+        return
+    file_id = msg.photo[-1].file_id
+    # If caption contains a number, use it
+    reading_value: Optional[float] = None
+    if msg.caption:
+        reading_value = _parse_float(msg.caption)
+    await _save_reading_and_reply(update, reading_value, file_id)
+
+
+async def on_number_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    value = _parse_float(msg.text)
+    if value is None:
+        return
+    await _save_reading_and_reply(update, value, None)
+
+
+async def job_daily_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = _now_tz()
+    day = now.day
+    if day < REMINDER_START_DAY or day > REMINDER_END_DAY:
+        return
+    mk = month_key_for(now)
+    for user in list_users(DB_PATH):
+        # if user has no reading this month, remind
+        existing = get_reading_for_month(DB_PATH, user["user_id"], mk)
+        if not existing or existing.get("reading_value") is None:
+            try:
+                await context.bot.send_message(
+                    chat_id=user["chat_id"],
+                    text=(
+                        "Reminder: please enter your electricity meter reading for this month "
+                        "(you can send a number or use /enter)."
+                    ),
+                )
+            except Exception as e:
+                logger.warning("Failed to send reminder to %s: %s", user["user_id"], e)
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("Please set BOT_TOKEN environment variable.")
+    init_db(DB_PATH)
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("tariff", cmd_tariff))
+    app.add_handler(CommandHandler("set_tariff", cmd_set_tariff))
+    app.add_handler(CommandHandler("enter", cmd_enter))
+
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_number_text))
+
+    # Schedule a daily reminder job at REMINDER_HOUR local time
+    local_tz = ZoneInfo(TZ_NAME)
+    app.job_queue.run_daily(job_daily_reminder, time=time(hour=REMINDER_HOUR, tzinfo=local_tz))
+
+    logger.info("Starting bot...")
+    app.run_polling(close_loop=False)
+
+
+if __name__ == "__main__":
+    main()
+
