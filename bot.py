@@ -35,6 +35,8 @@ from storage import (
     get_reading_for_month,
     get_history,
     list_users,
+    get_most_recent_reading,
+    delete_reading_by_id,
 )
 
 
@@ -179,6 +181,24 @@ async def on_number_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _save_reading_and_reply(update, value, None)
 
 
+async def cmd_remove_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    last = get_most_recent_reading(DB_PATH, user.id)
+    if not last:
+        await update.message.reply_text("No readings found to remove.")
+        return
+    removed = delete_reading_by_id(DB_PATH, last["id"])  # type: ignore[index]
+    if removed:
+        rv = last.get("reading_value")
+        mk = last.get("month_key")
+        if rv is not None:
+            await update.message.reply_text(f"Removed last reading {rv} for {mk}.")
+        else:
+            await update.message.reply_text(f"Removed last entry for {mk} (no numeric reading saved).")
+    else:
+        await update.message.reply_text("Failed to remove the last reading. Please try again.")
+
+
 async def job_daily_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = _now_tz()
     day = now.day
@@ -215,6 +235,7 @@ def main() -> None:
     app.add_handler(CommandHandler("tariff", cmd_tariff))
     app.add_handler(CommandHandler("set_tariff", cmd_set_tariff))
     app.add_handler(CommandHandler("enter", cmd_enter))
+    app.add_handler(CommandHandler("remove_last", cmd_remove_last))
 
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_number_text))

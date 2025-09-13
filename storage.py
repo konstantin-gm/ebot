@@ -203,3 +203,32 @@ def list_users(db_path: str) -> List[Dict[str, Any]]:
     finally:
         conn.close()
 
+
+def get_most_recent_reading(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
+    conn = _connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT * FROM readings
+            WHERE user_id=?
+            ORDER BY month_key DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def delete_reading_by_id(db_path: str, reading_id: int) -> bool:
+    conn = _connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM readings WHERE id=?", (reading_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
