@@ -86,6 +86,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- /tariff — show current tariff\n"
         "- /set_tariff <price> — set tariff per kWh\n"
         "- /enter <reading> — record current meter reading\n"
+        "- /remove_last — remove your last saved reading\n"
         "- /history — show recent months\n\n"
         "You can also send a number as a message, or upload a photo (optionally with the reading in the caption)."
     )
@@ -181,6 +182,45 @@ async def on_number_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _save_reading_and_reply(update, value, None)
 
 
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    # optional limit arg, default 12
+    limit = 12
+    if context.args:
+        try:
+            limit = max(1, min(36, int(context.args[0])))
+        except Exception:
+            pass
+    items = get_history(DB_PATH, user.id, limit=limit)
+    if not items:
+        await update.message.reply_text("No readings yet. Send a number or use /enter to add one.")
+        return
+    # Present oldest first for readability
+    lines = []
+    for item in reversed(items):
+        mk: str = item.get("month_key")  # type: ignore[assignment]
+        ym = mk[:7] if mk else "?"
+        rv = item.get("reading_value")
+        if rv is None:
+            lines.append(f"{ym}: [no numeric reading]")
+            continue
+        prev = get_last_reading_before_month(DB_PATH, user.id, mk)
+        if prev and prev.get("reading_value") is not None:
+            delta = float(rv) - float(prev["reading_value"])  # type: ignore[index]
+            if delta < 0:
+                lines.append(f"{ym}: {rv:.3f} (delta negative vs {prev['reading_value']})")
+            else:
+                tariff_applied = item.get("tariff_applied")
+                if tariff_applied is None:
+                    tariff_applied = get_tariff(DB_PATH, user.id)
+                cost = delta * float(tariff_applied)
+                lines.append(f"{ym}: {rv:.3f} | used {delta:.3f} kWh | cost {cost:.2f}")
+        else:
+            lines.append(f"{ym}: {rv:.3f} (no previous reading)")
+    msg = "Recent readings:\n" + "\n".join(lines)
+    await update.message.reply_text(msg)
+
+
 async def cmd_remove_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     last = get_most_recent_reading(DB_PATH, user.id)
@@ -228,6 +268,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("tariff", "Show current tariff"),
         BotCommand("set_tariff", "Set tariff per kWh"),
         BotCommand("enter", "Save this month's reading"),
+        BotCommand("history", "Show recent readings"),
         BotCommand("remove_last", "Remove your last saved reading"),
     ]
     try:
@@ -251,6 +292,7 @@ def main() -> None:
     app.add_handler(CommandHandler("set_tariff", cmd_set_tariff))
     app.add_handler(CommandHandler("enter", cmd_enter))
     app.add_handler(CommandHandler("remove_last", cmd_remove_last))
+    app.add_handler(CommandHandler("history", cmd_history))
 
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_number_text))
