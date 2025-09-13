@@ -75,6 +75,29 @@ def _parse_float(text: str) -> Optional[float]:
         return None
 
 
+def _parse_date(text: str) -> Optional[datetime]:
+    s = text.strip()
+    tz = ZoneInfo(TZ_NAME)
+    formats = [
+        "%Y-%m",
+        "%Y-%m-%d",
+        "%d.%m.%Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y.%m.%d",
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(s, fmt)
+            # If only year-month, default to day 1
+            if fmt == "%Y-%m":
+                dt = dt.replace(day=1)
+            return dt.replace(tzinfo=tz, hour=0, minute=0, second=0, microsecond=0)
+        except Exception:
+            continue
+    return None
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -85,7 +108,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Commands:\n"
         "- /tariff — show current tariff\n"
         "- /set_tariff <price> — set tariff per kWh\n"
-        "- /enter <reading> — record current meter reading\n"
+        "- /enter <reading> [YYYY-MM or YYYY-MM-DD] — record a reading (optionally for a past date)\n"
         "- /remove_last — remove your last saved reading\n"
         "- /history — show recent months\n\n"
         "You can also send a number as a message, or upload a photo (optionally with the reading in the caption)."
@@ -116,10 +139,16 @@ async def cmd_set_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(f"Tariff updated: {float(value):.4f} per kWh")
 
 
-async def _save_reading_and_reply(update: Update, reading_value: Optional[float], photo_file_id: Optional[str]) -> None:
+async def _save_reading_and_reply(
+    update: Update,
+    reading_value: Optional[float],
+    photo_file_id: Optional[str],
+    target_dt: Optional[datetime] = None,
+) -> None:
     user = update.effective_user
     now = _now_tz()
-    mk = month_key_for(now)
+    dt = target_dt or now
+    mk = month_key_for(dt)
     tariff = get_tariff(DB_PATH, user.id)
     record_reading(DB_PATH, user.id, mk, reading_value, photo_file_id, tariff if reading_value is not None else None)
     current = get_reading_for_month(DB_PATH, user.id, mk)
@@ -151,13 +180,26 @@ async def _save_reading_and_reply(update: Update, reading_value: Optional[float]
 
 async def cmd_enter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /enter <reading>")
+        await update.message.reply_text("Usage: /enter <reading> [YYYY-MM or YYYY-MM-DD]")
         return
-    value = _parse_float(" ".join(context.args))
+    reading_text = context.args[0]
+    date_text = context.args[1] if len(context.args) >= 2 else None
+    value = _parse_float(reading_text)
     if value is None:
-        await update.message.reply_text("Please send a valid number.")
+        await update.message.reply_text("Please provide a valid number for the reading.")
         return
-    await _save_reading_and_reply(update, value, None)
+    target_dt: Optional[datetime] = None
+    if date_text:
+        parsed = _parse_date(date_text)
+        if not parsed:
+            await update.message.reply_text("Invalid date. Use YYYY-MM or YYYY-MM-DD.")
+            return
+        # Optional: prevent future dates
+        if parsed > _now_tz():
+            await update.message.reply_text("Date cannot be in the future.")
+            return
+        target_dt = parsed
+    await _save_reading_and_reply(update, value, None, target_dt)
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
