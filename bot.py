@@ -2,8 +2,18 @@ import os
 import re
 import logging
 from datetime import datetime, time
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:  # pragma: no cover
+    from backports.zoneinfo import ZoneInfo  # Python <3.9
 from typing import Optional
+
+# Load .env if present (optional dependency)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 from telegram import Update
 from telegram.ext import (
@@ -192,8 +202,10 @@ async def job_daily_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    if not BOT_TOKEN:
-        raise SystemExit("Please set BOT_TOKEN environment variable.")
+    if not BOT_TOKEN or "YOUR_TELEGRAM_BOT_TOKEN" in BOT_TOKEN or BOT_TOKEN.startswith("123456:"):
+        raise SystemExit(
+            "Invalid or placeholder BOT_TOKEN. Set a real token from @BotFather (e.g., export BOT_TOKEN=123:ABC...)."
+        )
     init_db(DB_PATH)
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -207,9 +219,14 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_number_text))
 
-    # Schedule a daily reminder job at REMINDER_HOUR local time
+    # Schedule a daily reminder job at REMINDER_HOUR local time (if JobQueue is available)
     local_tz = ZoneInfo(TZ_NAME)
-    app.job_queue.run_daily(job_daily_reminder, time=time(hour=REMINDER_HOUR, tzinfo=local_tz))
+    if getattr(app, "job_queue", None):
+        app.job_queue.run_daily(job_daily_reminder, time=time(hour=REMINDER_HOUR, tzinfo=local_tz))
+    else:
+        logger.warning(
+            "JobQueue is not available. Install 'python-telegram-bot[job-queue]' to enable reminders."
+        )
 
     logger.info("Starting bot...")
     app.run_polling(close_loop=False)
@@ -217,4 +234,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
