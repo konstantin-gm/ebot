@@ -2,3 +2,6 @@ python-telegram-bot[job-queue]>=21.0
 backports.zoneinfo; python_version < '3.9'
 tzdata
 python-dotenv
+opencv-python
+pytesseract
+numpy

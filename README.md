@@ -6,6 +6,7 @@ Features:
 - Reminds every month before the 25th to enter electricity meter readings.
 - Accepts manual readings via text or `/enter <value>`.
 - Accepts a photo upload (optionally with the reading in the caption); stores photo for reference.
+- Tries to extract the reading from uploaded photos using OpenCV + Tesseract OCR (optional; see below).
 - Stores all readings, tracks per-user tariff, and calculates the current month cost from the previous reading.
 - Tariff can be changed by the user at any time.
 
@@ -62,3 +63,14 @@ Notes:
 
 - Main entry: `bot.py`
 - Storage module: `storage.py`
+
+## OCR (optional)
+
+- The bot can OCR numbers from photos.
+- Requires: `opencv-python`, `pytesseract`, and the Tesseract binary installed on your system.
+- Install packages: `pip install -r requirements.txt` (already includes OCR libs).
+- Install Tesseract binary:
+  - Ubuntu/Debian: `sudo apt-get install tesseract-ocr`
+  - macOS (Homebrew): `brew install tesseract`
+  - Windows: install from https://github.com/UB-Mannheim/tesseract/wiki
+- If Tesseract isn’t installed, the bot still works; it just asks you to input the number manually.

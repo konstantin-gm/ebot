@@ -149,7 +149,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- /enter <reading> [YYYY-MM or YYYY-MM-DD] — record a reading (optionally for a past date)\n"
         "- /remove_last — remove your last saved reading\n"
         "- /history — show recent months\n\n"
-        "You can also send a number as a message, or upload a photo (optionally with the reading in the caption)."
+        "You can also send a number as a message, or upload a photo. I will try to read the number automatically; otherwise please send it as a message."
     )
     await update.message.reply_text(msg)
 
@@ -193,7 +193,7 @@ async def _save_reading_and_reply(
     prev = get_last_reading_before_month(DB_PATH, user.id, mk)
 
     if reading_value is None:
-        await update.effective_message.reply_text("Photo saved. Please send the reading value as a number or with a caption.")
+        await update.effective_message.reply_text("Photo saved. Please send the reading value as a number.")
         return
 
     if prev and prev.get("reading_value") is not None:
@@ -245,10 +245,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg or not msg.photo:
         return
     file_id = msg.photo[-1].file_id
-    # If caption contains a number, use it
+    # Do not use numbers from captions; only OCR or manual entry
     reading_value: Optional[float] = None
-    if msg.caption:
-        reading_value = _parse_float(msg.caption)
     if reading_value is None and _OCR_AVAILABLE:
         try:
             # Download photo to temp path
