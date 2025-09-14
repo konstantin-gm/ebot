@@ -6,7 +6,11 @@ try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:  # pragma: no cover
     from backports.zoneinfo import ZoneInfo  # Python <3.9
-from typing import Optional
+from typing import Optional, List, Tuple
+import cv2
+import re
+from functools import lru_cache
+
 
 # Load .env if present (optional dependency)
 try:
@@ -39,6 +43,11 @@ from storage import (
     get_most_recent_reading,
     delete_reading_by_id,
 )
+
+# Plotting (headless)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # Optional OCR deps and Tesseract binary
 try:
@@ -129,306 +138,443 @@ def _parse_date(text: str) -> Optional[datetime]:
             continue
     return None
 
+# def _ocr_number_from_image(img_bgr) -> Optional[float]:
+#     if not _OCR_AVAILABLE:
+#         return None
+#     try:
+#         debug_dir = os.getenv("EBOT_OCR_DEBUG_DIR")
+#         def dbg_save(name: str, img) -> None:
+#             if not debug_dir:
+#                 return
+#             try:
+#                 os.makedirs(debug_dir, exist_ok=True)
+#                 cv2.imwrite(os.path.join(debug_dir, name), img)
+#             except Exception:
+#                 pass
 
-def _ocr_number_from_image(img_bgr) -> Optional[float]:
-    if not _OCR_AVAILABLE:
-        return None
+#         img = img_bgr
+#         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+#         dbg_save("00_gray.png", gray)
+
+#         # Scale up small images to help OCR
+#         h, w = gray.shape[:2]
+#         scale = 1.0
+#         target_max = 1200
+#         if max(h, w) < target_max:
+#             scale = min(3.0, target_max / float(max(h, w)))
+#             if scale > 1.2:
+#                 gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+#         # Denoise & enhance contrast
+#         gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+#         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+#         gray_eq = clahe.apply(gray_blur)
+#         dbg_save("01_gray_eq.png", gray_eq)
+
+#         # Try to find the main digit band (display area)
+#         def find_display_roi(src_gray: np.ndarray) -> np.ndarray:
+#             g = src_gray
+#             # Edge map to find rectangular bands
+#             edges = cv2.Canny(g, 50, 150)
+#             edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+#             contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+#             H, W = g.shape[:2]
+#             best = None
+#             best_score = 0.0
+#             for cnt in contours:
+#                 x, y, w2, h2 = cv2.boundingRect(cnt)
+#                 area = w2 * h2
+#                 if area < 0.01 * W * H:
+#                     continue
+#                 ar = w2 / float(h2 + 1e-6)
+#                 if ar < 2.2 or ar > 12.0:
+#                     continue
+#                 # Prefer central and larger areas
+#                 cx = x + w2 / 2.0
+#                 cy = y + h2 / 2.0
+#                 center_score = 1.0 - (abs(cx - W / 2.0) / (W / 2.0)) * 0.3 - (abs(cy - H / 2.0) / (H / 2.0)) * 0.3
+#                 score = (area / (W * H)) * 0.6 + center_score * 0.4
+#                 if score > best_score:
+#                     best_score = score
+#                     best = (x, y, w2, h2)
+#             if best is None:
+#                 return src_gray
+#             x, y, w2, h2 = best
+#             pad = int(0.06 * max(w2, h2))
+#             x0 = max(0, x - pad)
+#             y0 = max(0, y - pad)
+#             x1 = min(W, x + w2 + pad)
+#             y1 = min(H, y + h2 + pad)
+#             return src_gray[y0:y1, x0:x1]
+
+#         roi = find_display_roi(gray_eq)
+#         dbg_save("02_roi.png", roi)
+#         # Dynamically find the strongest digit band by vertical projection of
+#         # inverted binary (white digits on black background). This replaces the
+#         # fixed "upper 75%" crop which could miss the band on some images.
+#         H_roi, W_roi = roi.shape[:2]
+#         _, roi_bin_inv = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+#         # Light open to reduce speckle
+#         roi_bin_inv = cv2.morphologyEx(roi_bin_inv, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+#         # Row-wise sum of white pixels (use reduce to keep speed)
+#         hist = cv2.reduce(roi_bin_inv, 1, cv2.REDUCE_SUM, dtype=cv2.CV_32S)
+#         hist = hist.reshape(-1)
+#         # Sliding window to pick the best band (55% of ROI height)
+#         win_h = max(int(0.55 * H_roi), 12)
+#         best_y, best_sum = 0, -1
+#         for y in range(0, max(1, H_roi - win_h + 1)):
+#             s = int(hist[y:y + win_h].sum())
+#             if s > best_sum:
+#                 best_sum = s
+#                 best_y = y
+#         y0 = best_y
+#         y1 = min(H_roi, best_y + win_h)
+#         roi_band = roi[y0:y1, :]
+#         dbg_save("03_roi_band.png", roi_band)
+#         # Use the upper part of the ROI to avoid the faint lower row
+#         H_roi, W_roi = roi.shape[:2]
+#         roi_band = roi[0:int(0.75 * H_roi), :]
+
+#         # Odometer-style printed digits segmentation: split into 5 slices and
+#         # OCR each digit individually with Tesseract in single-char mode.
+#         def odometer_segmented(roi_gray: np.ndarray) -> Optional[str]:
+#             H, W = roi_gray.shape[:2]
+#             if H < 10 or W < 50:
+#                 return None
+#             # Keep upper portion to avoid secondary row
+#             roi_u = roi_gray[0:int(0.7 * H), :]
+#             # Threshold variants
+#             _, bin_white = cv2.threshold(roi_u, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)   # digits white
+#             _, bin_black = cv2.threshold(roi_u, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)  # digits black
+#             bin_white = cv2.morphologyEx(bin_white, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+
+#             # Find digit span using largest white components
+#             contours, _ = cv2.findContours(bin_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+#             comps = []
+#             for c in contours:
+#                 x, y, w2, h2 = cv2.boundingRect(c)
+#                 area = w2 * h2
+#                 if h2 < 0.45 * roi_u.shape[0] or area < 0.003 * (roi_u.shape[0] * roi_u.shape[1]):
+#                     continue
+#                 comps.append((x, y, w2, h2, area))
+#             if len(comps) >= 3:
+#                 x_min = min(x for (x, y, w2, h2, a) in comps)
+#                 x_max = max(x + w2 for (x, y, w2, h2, a) in comps)
+#             else:
+#                 # Fallback to full width
+#                 x_min, x_max = 0, roi_u.shape[1] - 1
+
+#             span = max(20, x_max - x_min)
+#             digit_w = span / 5.0
+
+#             out_chars: list[str] = []
+#             for i in range(5):
+#                 x0 = int(x_min + i * digit_w)
+#                 x1 = int(x_min + (i + 1) * digit_w)
+#                 pad = int(0.06 * digit_w)
+#                 x0 = max(0, x0 - pad)
+#                 x1 = min(roi_u.shape[1], x1 + pad)
+#                 dimg = bin_black[:, x0:x1]
+#                 if dimg.size == 0 or dimg.shape[1] < 5:
+#                     return None
+#                 # Normalize size for Tesseract
+#                 dimg = cv2.resize(dimg, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+#                 conf = "--oem 1 --psm 10 -c tessedit_char_whitelist=0123456789 classify_bln_numeric_mode=1"
+#                 try:
+#                     t = pytesseract.image_to_string(dimg, config=conf)
+#                 except Exception:
+#                     return None
+#                 t = re.sub(r"\D", "", t or "")
+#                 if len(t) == 0:
+#                     # Try inverted single-digit too
+#                     try:
+#                         t2 = pytesseract.image_to_string(255 - dimg, config=conf)
+#                         t2 = re.sub(r"\D", "", t2 or "")
+#                     except Exception:
+#                         t2 = ""
+#                     if len(t2) == 0:
+#                         return None
+#                     out_chars.append(t2[0])
+#                 else:
+#                     out_chars.append(t[0])
+#             s = "".join(out_chars)
+#             return s if len(s) == 5 else None
+
+#         s_od = odometer_segmented(roi)
+#         if s_od and len(s_od) == 5:
+#             try:
+#                 return float(s_od)
+#             except Exception:
+#                 pass
+
+#         # Seven-segment detection disabled by request; using box-based and slice OCR below.
+
+#         # Build multiple candidates (thresholded/raw). We'll first try to get
+#         # the 5 largest digit boxes using Tesseract's box output.
+#         _, th_bin = cv2.threshold(roi_band, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+#         _, th_inv = cv2.threshold(roi_band, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+#         kernel = np.ones((3, 3), np.uint8)
+#         th_bin_c = cv2.morphologyEx(th_bin, cv2.MORPH_CLOSE, kernel, iterations=1)
+#         th_inv_c = cv2.morphologyEx(th_inv, cv2.MORPH_CLOSE, kernel, iterations=1)
+#         dbg_save("04_th_bin_c.png", th_bin_c)
+#         dbg_save("05_th_inv_c.png", th_inv_c)
+
+#         def top5_from_boxes(image_single_channel, tag: str) -> Optional[str]:
+#             try:
+#                 conf = "--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789 load_system_dawg=0 load_freq_dawg=0"
+#                 boxes_txt = pytesseract.image_to_boxes(image_single_channel, config=conf)
+#                 if not boxes_txt:
+#                     return None
+#                 digits = []
+#                 Hh, Ww = image_single_channel.shape[:2]
+#                 for line in boxes_txt.splitlines():
+#                     parts = line.strip().split()
+#                     if len(parts) < 5:
+#                         continue
+#                     ch = parts[0]
+#                     if ch < '0' or ch > '9':
+#                         continue
+#                     try:
+#                         x1, y1, x2, y2 = map(int, parts[1:5])
+#                         w_box = max(0, x2 - x1)
+#                         h_box = max(0, y2 - y1)
+#                         area = w_box * h_box
+#                         # Loosen thresholds: some samples have smaller glyphs
+#                         if h_box < 0.25 * Hh or w_box < 0.04 * Ww or area < 0.001 * Hh * Ww:
+#                             continue
+#                         digits.append((ch, x1, y1, x2, y2, area))
+#                     except Exception:
+#                         continue
+#                 if len(digits) < 5:
+#                     return None
+#                 # Pick 5 with largest area
+#                 digits_sorted_area = sorted(digits, key=lambda t: t[5], reverse=True)[:5]
+#                 # Sort left-to-right
+#                 digits_ltr = sorted(digits_sorted_area, key=lambda t: t[1])
+#                 s = ''.join(d[0] for d in digits_ltr)
+#                 # Debug visualization
+#                 if debug_dir:
+#                     try:
+#                         vis = image_single_channel
+#                         if len(vis.shape) == 2:
+#                             vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+#                         for ch2, x1b, y1b, x2b, y2b, areab in digits:
+#                             cv2.rectangle(vis, (x1b, y1b), (x2b, y2b), (255, 0, 0), 1)
+#                         for ch2, x1b, y1b, x2b, y2b, areab in digits_ltr:
+#                             cv2.rectangle(vis, (x1b, y1b), (x2b, y2b), (0, 255, 0), 2)
+#                         cv2.putText(vis, s[:5] if len(s) >= 5 else s, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+#                         dbg_save(f"06_boxes_{tag}.png", vis)
+#                     except Exception:
+#                         pass
+#                 return s[:5] if len(s) >= 5 else None
+#             except Exception:
+#                 return None
+
+#         for cand, tag in ((th_inv_c, 'th_inv'), (th_bin_c, 'th_bin'), (roi_band, 'roi_band')):
+#             s5 = top5_from_boxes(cand, tag)
+#             if s5 and len(s5) >= 5:
+#                 try:
+#                     return float(s5)
+#                 except Exception:
+#                     pass
+
+#         # Fallback: classic OCR and take first 5 digits from the longest run
+#         def best_digits_from_text(text: str) -> Optional[str]:
+#             import re as _re
+#             runs = _re.findall(r"\d+", text)
+#             if not runs:
+#                 digits = _re.sub(r"\D", "", text)
+#                 return digits if len(digits) >= 4 else None
+#             longest = max(runs, key=len)
+#             return longest[:5] if len(longest) >= 5 else longest
+
+#         ocr_confs = [
+#             "--oem 1 --psm 7 -c tessedit_char_whitelist=0123456789 load_system_dawg=0 load_freq_dawg=0",
+#             "--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789 load_system_dawg=0 load_freq_dawg=0",
+#             "--oem 1 --psm 8 -c tessedit_char_whitelist=0123456789 load_system_dawg=0 load_freq_dawg=0",
+#         ]
+#         for conf in ocr_confs:
+#             try:
+#                 text = pytesseract.image_to_string(roi_band, config=conf)
+#                 digits = best_digits_from_text(text)
+#                 if digits and len(digits) >= 5:
+#                     return float(digits[:5])
+#             except Exception:
+#                 continue
+#         return None
+#     except Exception:
+#         return None
+
+
+
+# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+
+def _crop_counter_band(img_bgr) -> np.ndarray:
+    """Находит и вырезает горизонтальную полосу счётчика (там, где цифры)."""
+    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Контраст/выравнивание
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    g = clahe.apply(g)
+
+    # Подчеркнём горизонтальные структуры
+    g_blur = cv2.GaussianBlur(g, (3, 3), 0)
+    _, th = cv2.threshold(g_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th = 255 - th
+
+    # Сжатие по вертикали: ищем «самую белую» горизонтальную полосу
+    h, w = th.shape
+    proj = th.sum(axis=1)
+    window = max(int(0.4 * h), 12)
+    best_i, best_s = 0, -1
+    for i in range(0, h - window):
+        s = proj[i:i + window].sum()
+        if s > best_s:
+            best_s, best_i = s, i
+    band = g[max(0, best_i - 3):min(h, best_i + window + 3), :]
+
+    # Лёгкая нормализация яркости и увеличение масштаба для OCR
+    band = cv2.resize(band, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    band = cv2.GaussianBlur(band, (3, 3), 0)
+    return band
+
+def _prep_for_ocr(gray: np.ndarray) -> np.ndarray:
+    """Бинаризация/инверсия под OCR."""
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # иногда Tesseract/EasyOCR лучше видят чёрное по белому — вернём обе версии
+    return th
+
+def _pick_5_digits(texts: List[str]) -> Optional[str]:
+    """Достаём 5 подряд идущих цифр из списка строк."""
+    joined = " ".join(texts)
+    # сначала берём ровно 5 подряд
+    m = re.search(r"\b(\d{5})\b", joined)
+    if m:
+        return m.group(1)
+    # иначе соберём все цифры подряд и попробуем вычленить 5 «самых плотных»
+    digits = re.findall(r"\d", joined)
+    if len(digits) >= 5:
+        return "".join(digits[:5])
+    return None
+
+# ---------- TESSERACT ----------
+@lru_cache(maxsize=1)
+def _has_pytesseract() -> bool:
     try:
-        img = img_bgr
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        import pytesseract  # noqa
+        return True
+    except Exception:
+        return False
 
-        # Scale up small images to help OCR
-        h, w = gray.shape[:2]
-        scale = 1.0
-        target_max = 1200
-        if max(h, w) < target_max:
-            scale = min(3.0, target_max / float(max(h, w)))
-            if scale > 1.2:
-                gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+def _ocr_with_tesseract(img: np.ndarray) -> List[str]:
+    if not _has_pytesseract():
+        return []
+    import pytesseract
+    out = []
+    conf = r"-c tessedit_char_whitelist=0123456789 --oem 1 --psm {}"
+    for psm in (7, 8, 13, 6, 11):  # разные режимы разметки
+        try:
+            txt = pytesseract.image_to_string(img, config=conf.format(psm))
+            if txt:
+                out.append(txt.strip())
+        except Exception:
+            pass
+    return out
 
-        # Denoise & enhance contrast
-        gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray_eq = clahe.apply(gray_blur)
-
-        # Try to find the main digit band (display area)
-        def find_display_roi(src_gray: np.ndarray) -> np.ndarray:
-            g = src_gray
-            # Edge map to find rectangular bands
-            edges = cv2.Canny(g, 50, 150)
-            edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            H, W = g.shape[:2]
-            best = None
-            best_score = 0.0
-            for cnt in contours:
-                x, y, w2, h2 = cv2.boundingRect(cnt)
-                area = w2 * h2
-                if area < 0.01 * W * H:
-                    continue
-                ar = w2 / float(h2 + 1e-6)
-                if ar < 2.2 or ar > 12.0:
-                    continue
-                # Prefer central and larger areas
-                cx = x + w2 / 2.0
-                cy = y + h2 / 2.0
-                center_score = 1.0 - (abs(cx - W / 2.0) / (W / 2.0)) * 0.3 - (abs(cy - H / 2.0) / (H / 2.0)) * 0.3
-                score = (area / (W * H)) * 0.6 + center_score * 0.4
-                if score > best_score:
-                    best_score = score
-                    best = (x, y, w2, h2)
-            if best is None:
-                return src_gray
-            x, y, w2, h2 = best
-            pad = int(0.06 * max(w2, h2))
-            x0 = max(0, x - pad)
-            y0 = max(0, y - pad)
-            x1 = min(W, x + w2 + pad)
-            y1 = min(H, y + h2 + pad)
-            return src_gray[y0:y1, x0:x1]
-
-        roi = find_display_roi(gray_eq)
-
-        # Odometer-style printed digits segmentation: split into 5 slices and
-        # OCR each digit individually with Tesseract in single-char mode.
-        def odometer_segmented(roi_gray: np.ndarray) -> Optional[str]:
-            H, W = roi_gray.shape[:2]
-            if H < 10 or W < 50:
-                return None
-            # Keep upper portion to avoid secondary row
-            roi_u = roi_gray[0:int(0.7 * H), :]
-            # Threshold variants
-            _, bin_white = cv2.threshold(roi_u, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)   # digits white
-            _, bin_black = cv2.threshold(roi_u, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)  # digits black
-            bin_white = cv2.morphologyEx(bin_white, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-
-            # Find digit span using largest white components
-            contours, _ = cv2.findContours(bin_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            comps = []
-            for c in contours:
-                x, y, w2, h2 = cv2.boundingRect(c)
-                area = w2 * h2
-                if h2 < 0.45 * roi_u.shape[0] or area < 0.003 * (roi_u.shape[0] * roi_u.shape[1]):
-                    continue
-                comps.append((x, y, w2, h2, area))
-            if len(comps) >= 3:
-                x_min = min(x for (x, y, w2, h2, a) in comps)
-                x_max = max(x + w2 for (x, y, w2, h2, a) in comps)
-            else:
-                # Fallback to full width
-                x_min, x_max = 0, roi_u.shape[1] - 1
-
-            span = max(20, x_max - x_min)
-            digit_w = span / 5.0
-
-            out_chars: list[str] = []
-            for i in range(5):
-                x0 = int(x_min + i * digit_w)
-                x1 = int(x_min + (i + 1) * digit_w)
-                pad = int(0.06 * digit_w)
-                x0 = max(0, x0 - pad)
-                x1 = min(roi_u.shape[1], x1 + pad)
-                dimg = bin_black[:, x0:x1]
-                if dimg.size == 0 or dimg.shape[1] < 5:
-                    return None
-                # Normalize size for Tesseract
-                dimg = cv2.resize(dimg, (0, 0), fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-                conf = "--oem 1 --psm 10 -c tessedit_char_whitelist=0123456789 classify_bln_numeric_mode=1"
-                try:
-                    t = pytesseract.image_to_string(dimg, config=conf)
-                except Exception:
-                    return None
-                t = re.sub(r"\D", "", t or "")
-                if len(t) == 0:
-                    # Try inverted single-digit too
-                    try:
-                        t2 = pytesseract.image_to_string(255 - dimg, config=conf)
-                        t2 = re.sub(r"\D", "", t2 or "")
-                    except Exception:
-                        t2 = ""
-                    if len(t2) == 0:
-                        return None
-                    out_chars.append(t2[0])
-                else:
-                    out_chars.append(t[0])
-            s = "".join(out_chars)
-            return s if len(s) == 5 else None
-
-        s_od = odometer_segmented(roi)
-        if s_od and len(s_od) == 5:
-            try:
-                return float(s_od)
-            except Exception:
-                pass
-
-        # Seven-segment specific recognition (helps distinguish 2 vs 7)
-        def sevenseg_read(roi_gray: np.ndarray) -> Optional[str]:
-            # Binarize and make segments white
-            _, th = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            # Decide inversion based on mean
-            if np.mean(th) > 127:
-                th = cv2.bitwise_not(th)
-            th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-            # Find digit contours
-            contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            H, W = th.shape[:2]
-            cand = []
-            for c in contours:
-                x, y, w2, h2 = cv2.boundingRect(c)
-                area = w2 * h2
-                if h2 < 0.35 * H or w2 < 0.05 * W:
-                    continue
-                if area < 0.005 * W * H:
-                    continue
-                cand.append((x, y, w2, h2, area))
-            if len(cand) < 3:
-                return None
-            # Take 5 largest by area, then left->right
-            cand = sorted(cand, key=lambda t: t[4], reverse=True)[:5]
-            cand = sorted(cand, key=lambda t: t[0])
-
-            # Segment sampling positions as fractions of bbox
-            seg_map = {
-                # a,    b,    c,    d,    e,    f,    g
-                (1, 1, 1, 1, 1, 1, 0): '0',
-                (0, 1, 1, 0, 0, 0, 0): '1',
-                (1, 1, 0, 1, 1, 0, 1): '2',
-                (1, 1, 1, 1, 0, 0, 1): '3',
-                (0, 1, 1, 0, 0, 1, 1): '4',
-                (1, 0, 1, 1, 0, 1, 1): '5',
-                (1, 0, 1, 1, 1, 1, 1): '6',
-                (1, 1, 1, 0, 0, 0, 0): '7',
-                (1, 1, 1, 1, 1, 1, 1): '8',
-                (1, 1, 1, 1, 0, 1, 1): '9',
-            }
-
-            def classify_digit(dimg: np.ndarray) -> Optional[str]:
-                hh, ww = dimg.shape[:2]
-                # pad to avoid border cut-offs
-                d = cv2.copyMakeBorder(dimg, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=0)
-                hh, ww = d.shape[:2]
-                # Define segment ROIs
-                def roi_rect(xr0, yr0, xr1, yr1):
-                    x0 = int(xr0 * ww)
-                    x1 = int(xr1 * ww)
-                    y0 = int(yr0 * hh)
-                    y1 = int(yr1 * hh)
-                    x0, y0 = max(0, x0), max(0, y0)
-                    x1, y1 = min(ww, x1), min(hh, y1)
-                    if x1 <= x0 or y1 <= y0:
-                        return d[0:1, 0:1]
-                    return d[y0:y1, x0:x1]
-
-                a = roi_rect(0.20, 0.08, 0.80, 0.22)
-                b = roi_rect(0.72, 0.15, 0.90, 0.52)
-                c = roi_rect(0.72, 0.50, 0.90, 0.88)
-                dseg = roi_rect(0.20, 0.78, 0.80, 0.92)
-                e = roi_rect(0.10, 0.50, 0.28, 0.88)
-                f = roi_rect(0.10, 0.15, 0.28, 0.52)
-                g = roi_rect(0.22, 0.45, 0.78, 0.58)
-
-                def on(m):
-                    # since digits are white on black, mean close to 255 indicates ON
-                    return (np.mean(m) / 255.0) > 0.45
-
-                key = (int(on(a)), int(on(b)), int(on(c)), int(on(dseg)), int(on(e)), int(on(f)), int(on(g)))
-                return seg_map.get(key)
-
-            out = []
-            for (x, y, w2, h2, _) in cand:
-                dimg = th[y:y+h2, x:x+w2]
-                ch = classify_digit(dimg)
-                if ch is None:
-                    return None
-                out.append(ch)
-            s = ''.join(out)
-            return s if len(s) >= 5 else None
-
-        s7 = sevenseg_read(roi)
-        if s7 and len(s7) >= 5:
-            try:
-                return float(s7[:5])
-            except Exception:
-                pass
-
-        # Build multiple candidates (thresholded/raw). We'll first try to get
-        # the 5 largest digit boxes using Tesseract's box output.
-        _, th_bin = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        _, th_inv = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-        kernel = np.ones((3, 3), np.uint8)
-        th_bin_c = cv2.morphologyEx(th_bin, cv2.MORPH_CLOSE, kernel, iterations=1)
-        th_inv_c = cv2.morphologyEx(th_inv, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        def top5_from_boxes(image_single_channel) -> Optional[str]:
-            try:
-                conf = "--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789 load_system_dawg=0 load_freq_dawg=0"
-                boxes_txt = pytesseract.image_to_boxes(image_single_channel, config=conf)
-                if not boxes_txt:
-                    return None
-                digits = []
-                for line in boxes_txt.splitlines():
-                    parts = line.strip().split()
-                    if len(parts) < 5:
-                        continue
-                    ch = parts[0]
-                    if ch < '0' or ch > '9':
-                        continue
-                    try:
-                        x1, y1, x2, y2 = map(int, parts[1:5])
-                        area = max(0, x2 - x1) * max(0, y2 - y1)
-                        digits.append((ch, x1, y1, x2, y2, area))
-                    except Exception:
-                        continue
-                if len(digits) < 5:
-                    return None
-                # Pick 5 with largest area
-                digits_sorted_area = sorted(digits, key=lambda t: t[5], reverse=True)[:5]
-                # Sort left-to-right
-                digits_ltr = sorted(digits_sorted_area, key=lambda t: t[1])
-                s = ''.join(d[0] for d in digits_ltr)
-                if len(s) == 5:
-                    return s
-                # If more than 5 due to duplicates, truncate to 5
-                return s[:5]
-            except Exception:
-                return None
-
-        for cand in (th_bin_c, gray_eq, th_inv_c):
-            s5 = top5_from_boxes(cand)
-            if s5 and len(s5) >= 5:
-                try:
-                    return float(s5)
-                except Exception:
-                    pass
-
-        # Fallback: classic OCR and take first 5 digits from the longest run
-        def best_digits_from_text(text: str) -> Optional[str]:
-            import re as _re
-            runs = _re.findall(r"\d+", text)
-            if not runs:
-                digits = _re.sub(r"\D", "", text)
-                return digits if len(digits) >= 4 else None
-            longest = max(runs, key=len)
-            return longest[:5] if len(longest) >= 5 else longest
-
-        ocr_confs = [
-            "--oem 1 --psm 7 -c tessedit_char_whitelist=0123456789 load_system_dawg=0 load_freq_dawg=0",
-            "--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789 load_system_dawg=0 load_freq_dawg=0",
-            "--oem 1 --psm 8 -c tessedit_char_whitelist=0123456789 load_system_dawg=0 load_freq_dawg=0",
-        ]
-        for conf in ocr_confs:
-            try:
-                text = pytesseract.image_to_string(roi, config=conf)
-                digits = best_digits_from_text(text)
-                if digits and len(digits) >= 5:
-                    return float(digits[:5])
-            except Exception:
-                continue
-        return None
+# ---------- EASYOCR ----------
+@lru_cache(maxsize=1)
+def _get_easyocr_reader():
+    try:
+        import easyocr
+        return easyocr.Reader(['en'], gpu=False)
     except Exception:
         return None
 
+def _ocr_with_easyocr(img: np.ndarray) -> List[str]:
+    reader = _get_easyocr_reader()
+    if reader is None:
+        return []
+    res = reader.readtext(img, detail=0, allowlist='0123456789', paragraph=False)
+    # res уже список строк
+    return [r for r in res if r]
+
+# ---------- PADDLEOCR ----------
+@lru_cache(maxsize=1)
+def _get_paddle_reader():
+    try:
+        from paddleocr import PaddleOCR
+        # латинский алфавит/цифры достаточно
+        return PaddleOCR(lang='en', use_angle_cls=False, rec=True, det=True, show_log=False)
+    except Exception:
+        return None
+
+def _ocr_with_paddle(img: np.ndarray) -> List[str]:
+    ocr = _get_paddle_reader()
+    if ocr is None:
+        return []
+    res = ocr.ocr(img, cls=False)
+    texts = []
+    # res — список страниц; возьмём все детекции, отсортированные слева-направо
+    for page in res:
+        if not page:
+            continue
+        # сортируем по x центра, чтобы получить «23653», а не вразнобой
+        page_sorted = sorted(page, key=lambda it: (it[0][0][0] + it[0][2][0]) / 2.0)
+        for _, (txt, conf) in page_sorted:
+            if conf is None:
+                continue
+            if re.fullmatch(r"[0-9]+", txt):
+                texts.append(txt)
+            else:
+                digits = "".join(re.findall(r"\d", txt))
+                if digits:
+                    texts.append(digits)
+    return texts
+
+# ---------- ЕДИНАЯ ФУНКЦИЯ ----------
+def _ocr_number_from_image(img_bgr) -> Optional[float]:
+    """
+    Распознаёт пятизначное число с механического счётчика/одометра.
+    Пробует Tesseract, EasyOCR и PaddleOCR (если доступны).
+    Возвращает float (например, 23653.0) или None.
+    """
+    if img_bgr is None:
+        return None
+
+    band = _crop_counter_band(img_bgr)
+    th = _prep_for_ocr(band)
+    th_inv = 255 - th
+
+    candidates: List[str] = []
+
+    # 1) Tesseract
+    candidates += [_pick_5_digits(_ocr_with_tesseract(th)) or ""]
+    candidates += [_pick_5_digits(_ocr_with_tesseract(th_inv)) or ""]
+
+    # 2) EasyOCR
+    candidates += [_pick_5_digits(_ocr_with_easyocr(th)) or ""]
+    candidates += [_pick_5_digits(_ocr_with_easyocr(th_inv)) or ""]
+
+    # 3) PaddleOCR
+    candidates += [_pick_5_digits(_ocr_with_paddle(th)) or ""]
+    candidates += [_pick_5_digits(_ocr_with_paddle(th_inv)) or ""]
+
+    # чистим пустые
+    candidates = [c for c in candidates if c]
+
+    if not candidates:
+        return None
+
+    # берём самое частое значение среди кандидатов
+    best = max(set(candidates), key=candidates.count)
+    try:
+        return float(int(best))
+    except Exception:
+        return None
+
+
+   
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -443,6 +589,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- /enter <reading> [YYYY-MM or YYYY-MM-DD] — record a reading (optionally for a past date)\n"
         "- /remove_last — remove your last saved reading\n"
         "- /history — show recent months\n\n"
+        "- /plot_readings [N] — plot last N monthly usage values (default 12)\n"
+        "- /plot_costs [N] — plot last N monthly costs (default 12)\n\n"
         "You can also send a number as a message, or upload a photo. I will try to read the number automatically; otherwise please send it as a message."
     )
     await update.message.reply_text(msg)
@@ -665,6 +813,120 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(msg)
 
 
+def _timeseries_for_user(user_id: int, limit: int) -> Tuple[List[str], List[float], List[float]]:
+    # returns labels (YYYY-MM), readings, costs (delta*k)
+    rows = get_history(DB_PATH, user_id, limit=limit)
+    if not rows:
+        return [], [], []
+    rows = list(reversed(rows))
+    labels: List[str] = []
+    readings: List[float] = []
+    costs: List[float] = []
+    prev_value: Optional[float] = None
+    for r in rows:
+        mk = r.get("month_key") or ""
+        labels.append(mk[:7] if mk else "?")
+        rv = r.get("reading_value")
+        if rv is None:
+            readings.append(float('nan'))
+            costs.append(float('nan'))
+            continue
+        v = float(rv)
+        readings.append(v)
+        # find previous numeric reading (can be from earlier rows)
+        if prev_value is None:
+            # look backwards from already built readings
+            # fallback: query storage
+            pass
+        if prev_value is not None:
+            delta = v - prev_value
+            if delta < 0:
+                costs.append(float('nan'))
+            else:
+                t = r.get("tariff_applied")
+                tariff = float(t) if t is not None else float(get_tariff(DB_PATH, user_id))
+                costs.append(delta * tariff)
+        else:
+            costs.append(float('nan'))
+        prev_value = v
+    return labels, readings, costs
+
+
+async def _send_plot(update: Update, title: str, labels: List[str], values: List[float], ylabel: str) -> None:
+    if not labels:
+        await update.message.reply_text("No data to plot yet.")
+        return
+    import math
+    # Filter out all-NaN series
+    if all((isinstance(v, float) and (math.isnan(v))) for v in values):
+        await update.message.reply_text("Not enough data to plot.")
+        return
+    plt.figure(figsize=(8, 3))
+    plt.plot(values, marker='o')
+    plt.title(title)
+    plt.ylabel(ylabel)
+    plt.xticks(range(len(labels)), labels, rotation=45, ha='right', fontsize=8)
+    plt.grid(True, linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    import tempfile, os as _os
+    _os.makedirs("data/tmp", exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir="data/tmp", suffix=".png", delete=False) as tmp:
+        path = tmp.name
+    plt.savefig(path)
+    plt.close()
+    try:
+        await update.message.chat.send_action("upload_photo")
+    except Exception:
+        pass
+    try:
+        with open(path, "rb") as fh:
+            await update.message.reply_photo(fh)
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+async def cmd_plot_readings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    limit = 12
+    if context.args:
+        try:
+            limit = max(3, min(36, int(context.args[0])))
+        except Exception:
+            pass
+    labels, readings, costs = _timeseries_for_user(user.id, limit)
+    # Convert absolute readings -> monthly increments (usage)
+    import math
+    usage: List[float] = []
+    prev: Optional[float] = None
+    for v in readings:
+        if isinstance(v, float) and math.isnan(v):
+            usage.append(float('nan'))
+            # do not update prev on NaN
+            continue
+        if prev is None:
+            usage.append(float('nan'))
+        else:
+            delta = v - prev
+            usage.append(delta if delta >= 0 else float('nan'))
+        prev = v
+    await _send_plot(update, "Monthly Usage", labels, usage, "kWh used")
+
+
+async def cmd_plot_costs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    limit = 12
+    if context.args:
+        try:
+            limit = max(3, min(36, int(context.args[0])))
+        except Exception:
+            pass
+    labels, readings, costs = _timeseries_for_user(user.id, limit)
+    await _send_plot(update, "Monthly Cost", labels, costs, "Cost")
+
+
 async def cmd_remove_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     last = get_most_recent_reading(DB_PATH, user.id)
@@ -714,6 +976,8 @@ async def _post_init(app: Application) -> None:
         BotCommand("enter", "Save this month's reading"),
         BotCommand("history", "Show recent readings"),
         BotCommand("remove_last", "Remove your last saved reading"),
+        BotCommand("plot_readings", "Plot recent readings"),
+        BotCommand("plot_costs", "Plot recent costs"),
     ]
     try:
         await app.bot.set_my_commands(commands)
@@ -737,6 +1001,8 @@ def main() -> None:
     app.add_handler(CommandHandler("enter", cmd_enter))
     app.add_handler(CommandHandler("remove_last", cmd_remove_last))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("plot_readings", cmd_plot_readings))
+    app.add_handler(CommandHandler("plot_costs", cmd_plot_costs))
 
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(CallbackQueryHandler(cb_ocr_confirm, pattern=r"^ocr_(yes|no)$"))

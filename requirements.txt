@@ -5,3 +5,4 @@ python-dotenv
 opencv-python
 pytesseract
 numpy
+matplotlib
